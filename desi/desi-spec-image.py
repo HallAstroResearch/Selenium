@@ -11,19 +11,19 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-#
+
+
 # Program to download and optionally rename DESI spectrum images
-# 
+#
 # DONE:
 # * Accept SDSS_NAME and use as beginning of output filenema
 # * list each image to terminal as it's created
-# 
+# * option to not display firefox at all i.e. headless mode (not recommended though)
+# * only display two DESI spectrum images at a time in firefox (currently loading one & previous one)
+#
 # TO DO:
-# * Answer "PBH ? for ZZZ" question below: had to changet netmonitor keys, but what does it do?
 # * Rework to accept input list including SDSS_NAME,targetid
-# * Output list of DESI spectrum images ( list to screen each one as it's created)
-# * Add option to not display in firefox, or only display two DESI spectrum images at a time in firefox (currently loading one & previous one)
+# * Output list of DESI spectrum images (list to screen each one as it's created)
 # * Goal is to create DESi spectrum images for all objects in AWTQ_DESI_20250703.xlsx on SharePoint
 
 from base64 import b64decode as base64decode
@@ -32,26 +32,34 @@ from pathlib import Path
 from re import sub as replace
 from sys import platform as PLATFORM
 from time import sleep
-from typing import Literal, cast
+from typing import Final, Literal, cast
+from urllib.parse import unquote as uri_decode
 
-from selenium.common import TimeoutException
-from selenium.webdriver import Firefox, FirefoxOptions, Keys
+from pandas import read_csv
+from selenium.common import JavascriptException, TimeoutException  # type: ignore[import-not-found]
+from selenium.webdriver import Firefox, FirefoxOptions, Keys  # type: ignore[import-not-found]
 from selenium.webdriver import Remote as Browser
+
 
 # Misc. functions
 def isapple() -> bool:
 	return PLATFORM == "darwin"
 
+def url2bytes(url: str) -> bytes:
+	data = replace(r"^data:[^,]*,", "", url)
+	return base64decode(data)
+
+def file2url(f: Path | str) -> str:
+	if not isa(f, Path): f = Path(f)
+	return uri_decode(f.absolute().as_uri())
+
 def filesize(f: Path | str) -> int:
-	if not isfile(f): return 0
-	if isa(f, Path):
-		return (f).stat().st_size
-	return Path(f).stat().st_size
+	if not isa(f, Path): f = Path(f)
+	return f.stat().st_size if isfile(f) else 0
 
 def isfile(f: Path | str) -> bool:
-	if isa(f, Path):
-		return (f).is_file()
-	return Path(f).is_file()
+	if not isa(f, Path): f = Path(f)
+	return f.is_file()
 
 def write(f: Path | str, x: bytes | str) -> int:
 	if isa(x, bytes):
@@ -63,11 +71,12 @@ def write(f: Path | str, x: bytes | str) -> int:
 
 # mypy: disable-error-code="func-returns-value"
 
-# Set up key combination to bring up the Dock in Firefox
+# Set up key combination to bring up the DevTools in Firefox
 if isapple():
-	netmonitor = Keys.COMMAND + Keys.LEFT_ALT + "E"
+	netmonitor = Keys.COMMAND + Keys.ALT + "E"
 else:
 	netmonitor = Keys.CONTROL + Keys.SHIFT + "E"
+# https://github.com/SeleniumHQ/selenium/pull/15948 # selenium v4.34.0
 
 # Set up Firefox browser
 def init(headless: bool = False) -> Browser:
@@ -79,6 +88,8 @@ def init(headless: bool = False) -> Browser:
 	opt.set_preference("browser.link.open_newwindow", 3)
 	opt.set_preference("browser.menu.showViewImageInfo", True)
 	opt.set_preference("browser.ml.enable", False)
+	opt.set_preference("browser.newtabpage.activity-stream.asrouter.providers.onboarding", "{}") # TAB_GROUP_ONBOARDING_CALLOUT
+	opt.set_preference("browser.urlbar.trimURLs", False)
 	opt.set_preference("datareporting.usage.uploadEnabled", False)
 	opt.set_preference("devtools.netmonitor.persistlog", True)
 	opt.set_preference("devtools.selfxss.count", 5)
@@ -95,44 +106,63 @@ def init(headless: bool = False) -> Browser:
 	opt.set_preference("security.pki.crlite_mode", 2)
 	opt.set_preference("sidebar.main.tools", "history")
 	ret = Firefox(opt)
-	ret.set_page_load_timeout(5)
+	ret.set_page_load_timeout(6)
 	ret.set_script_timeout(3)
 	ret.set_window_size(1600, 900) if headless else None
 	return ret
 
-# Load spectrum image from a given data release (dr) of a given DESI targetid (id) 
+# Load spectrum image from a given data release (dr) of a given DESI targetid (id)
 def load(br: Browser, dr: Literal["edr", "dr1"], id: int | str) -> bytes:
 	# https://data.desi.lbl.gov/doc/access/
 	br.get(f"https://www.legacysurvey.org/viewer/desi-spectrum/{dr}/targetid{id}")
 	js = """return document.querySelector("canvas").toDataURL("image/png")"""
-	rv = cast(str, br.execute_script(js))
+	try:
+		rv = cast(str, br.execute_script(js))
+	except JavascriptException: # Bokeh Error
+		rv = cast(str, br.execute_script(js))
 	br.get(rv)
-	rv = replace(r"^data:[^,]*,", "", rv)
-	return base64decode(rv)
+	return url2bytes(rv)
 
 # Save spectrum image to disk
-def save(br: Browser, sdss_name: str, dr: Literal["edr", "dr1"], id: int | str, path: str | None = None) -> None:
-#def save(br: Browser, dr: Literal["edr", "dr1"], id: int | str, path: str | None = None) -> None:
-	#if path is None: path = f"desi-{dr}-{id}.png"
-	if path is None: path = f"{sdss_name}-desi-{dr}-{id}.png"
+def save(br: Browser, dr: Literal["edr", "dr1"], id: int | str, dst: Path | str = "", log_prefix: str = "") -> None:
+	if not dst: dst = f"desi-{dr}-{id}.png"
 	br.switch_to.new_window() # new tab
-	if filesize(path) > 0: return br.get(Path(path).absolute().as_uri()) # already exists
+	if filesize(dst) > 0: return br.get(file2url(dst)) # already exists
 	br.get("about:logo"), br.switch_to.active_element.send_keys(netmonitor), sleep(1)
 	while True:
 		try:
 			data = load(br, dr, id)
 			break
-		except TimeoutException: sleep(2)
-	write(path, data)
-	print(f"{path} created")
+		except TimeoutException: sleep(3)
+		except JavascriptException as e: # unlikely
+			return print(log_prefix + "ignored", dr, id, f"\n{e}")
+	write(dst, data)
+	print(log_prefix + "created", dr, id, "@", dst)
 
-# Main program loop
+def close_oldest(br: Browser, keep_ntab: int) -> None:
+	while len(br.window_handles) > max(keep_ntab, +1):
+		br.switch_to.window(br.window_handles[+0]) # oldest tab
+		br.close()
+	else: # finally
+		br.switch_to.window(br.window_handles[-1]) # newest tab
+
+# Main program
 if __name__ == "__main__":
+	__dir__: Final = Path(__file__).parent
 	ff = init()
-	save(ff, "081148.27+083240.1", "dr1", 39627991554195594) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784286649
-	#save(ff, "152348.99-004701.8", "dr1", 39627770480824813) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784286649
-	#save(ff, "124652.81-081312.9", "dr1", 39627589169449230) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784286649
-	##save(ff, "dr1", 39627848784286649) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784286649
-	##save(ff, "dr1", 39627848784285507) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784285507
+	df = read_csv(__dir__ / "AWTQ_DESI_20250703DR1.tsv", sep="\t")
+	df = df[0:10]
+	dr: Final = "dr1"
+	nrow = len(df)
+	nrow_ndigit = len(str(nrow))
+	for idx, row in df.iterrows():
+		name, id = row["SDSS_NAME"], row["targetid"]
+		progress = f"[%{nrow_ndigit}d/{nrow}] " % (int(str(idx)) + 1)
+		save(ff, dr, id, f"spec/{name}-desi-{dr}-{id}.png", progress)
+		close_oldest(ff, 2) # keep at most 2 tabs
+	else: print("finished") # finally
+	# save(ff, "dr1", 39627802856653317) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627802856653317 #!broken
+	# save(ff, "dr1", 39627848784285507) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784285507
+	# save(ff, "dr1", 39627848784286649) # https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid39627848784286649
 	# ff.quit() # close the browser
 
