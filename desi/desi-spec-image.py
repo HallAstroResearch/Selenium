@@ -63,13 +63,11 @@ def write(f: Path | str, x: bytes | str) -> int:
 
 # mypy: disable-error-code="func-returns-value"
 
-# PBH ? for ZZZ: what is this for? Had to simplify as shown for program to run
+# Set up key combination to bring up the Dock in Firefox
 if isapple():
-	#netmonitor = Keys.LEFT_COMMAND + Keys.LEFT_OPTION + "E"
-	netmonitor = Keys.SHIFT + "E"
+	netmonitor = Keys.COMMAND + Keys.LEFT_ALT + "E"
 else:
-	#netmonitor = Keys.LEFT_CONTROL + Keys.LEFT_SHIFT + "E"
-	netmonitor = Keys.SHIFT + "E"
+	netmonitor = Keys.CONTROL + Keys.SHIFT + "E"
 
 # Set up Firefox browser
 def init(headless: bool = False) -> Browser:
